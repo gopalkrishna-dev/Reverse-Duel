@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Reverse Duel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{--bg:#fff7f0;--fg:#2a1f2d;--card:#fff;--ac:#e0457b;--mut:#7a6a7e;--ok:#1f9d55;--bad:#d64545;--bd:#f0dcd0}
+@media (prefers-color-scheme:dark){:root{--bg:#1b1420;--fg:#f5eaf3;--card:#271d2d;--ac:#ff6fa0;--mut:#b6a3bb;--bd:#3b2d43;color-scheme:dark}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:520px;margin:0 auto;padding:16px 14px 40px}
+h1{font-size:26px;margin:6px 0 2px;text-align:center}
+.sub,.mut{color:var(--mut)}.sub{text-align:center;margin:0 0 14px}.mut{font-size:14px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:14px;margin:10px 0}
+button{font:inherit;border:0;border-radius:12px;padding:12px 14px;margin:5px 0;width:100%;background:var(--ac);color:#fff;font-weight:600;cursor:pointer}
+button.alt{background:transparent;color:var(--fg);border:1.5px solid var(--bd)}
+button.rec{background:var(--bad);font-size:18px;padding:16px}
+button:disabled{opacity:.5}
+input{font:inherit;width:100%;padding:12px;border-radius:12px;border:1.5px solid var(--bd);background:var(--bg);color:var(--fg);margin:5px 0}
+.row{display:flex;gap:8px}.row>*{flex:1}.row button{flex:0 0 80px}
+.chip,.pill{display:inline-block;background:var(--bd);border-radius:99px;padding:3px 10px;margin:2px;font-size:14px}
+.chip.on{background:var(--ac);color:#fff}
+.big{font-size:42px;text-align:center;letter-spacing:6px;font-weight:800;color:var(--ac)}
+.step{font-weight:700;margin:0 0 4px}
+table{width:100%;border-collapse:collapse}td,th{padding:6px 4px;text-align:left;border-bottom:1px solid var(--bd)}
+#msgs{height:150px;overflow-y:auto;font-size:14px;margin-bottom:6px}
+#msgs p{margin:3px 0}#msgs .sys{color:var(--mut);font-style:italic}
+.err{border-color:var(--bad);color:var(--bad)}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+</head><body><main id="app"></main>
+<script>
+/* ===== Settings (tweak freely) ===== */
+const MAXP=6, SING_MAX=8000, LISTEN_MS=30000, ATT_MS=30000, ATT_REC=10000, RESULT_MS=10000;
+const ACCURATE=50;  // score % that counts as an accurate copy (for the singer's points)
+const MIN_PTS=15;   // a guesser needs at least this score % to win placement points
+const PLACE_PTS=[5,3,1];
+
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ABC='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const newCode=()=>Array.from({length:4},()=>ABC[Math.floor(Math.random()*ABC.length)]).join('');
+
+/* ===== Audio helpers ===== */
+let ctx=null;const AC=()=>ctx=ctx||new(window.AudioContext||window.webkitAudioContext)();
+async function decode(blob,rev){const b=await AC().decodeAudioData(await blob.arrayBuffer());if(rev)for(let c=0;c<b.numberOfChannels;c++)b.getChannelData(c).reverse();return b}
+function playBuf(b){const c=AC();c.resume();const s=c.createBufferSource();s.buffer=b;s.connect(c.destination);s.start()}
+function mono8(b){const d=b.getChannelData(0),k=Math.max(1,Math.round(b.sampleRate/8000)),n=Math.floor(d.length/k),o=new Float32Array(n);for(let i=0;i<n;i++){let s=0;for(let j=0;j<k;j++)s+=d[i*k+j];o[i]=s/k}return o}
+
+/* ===== Waveform similarity: band features + DTW, returns 0-100 ===== */
+const FQ=[200,280,400,560,800,1100,1600,2200,3000].map(f=>2*Math.cos(2*Math.PI*f/8000));
+function feats(x){
+  const N=256,H=128,F=[],E=[];
+  for(let s=0;s+N<=x.length;s+=H){let tot=0;const v=[];
+    for(const c of FQ){let a=0,b=0;for(let i=0;i<N;i++){const t=x[s+i]+c*a-b;b=a;a=t}const p=a*a+b*b-c*a*b;v.push(Math.log(p+1e-7));tot+=p}
+    E.push(tot);F.push(v)}
+  const mx=Math.max(...E,1e-9);let a=0,b=F.length-1;
+  while(a<b&&E[a]<mx*.02)a++;while(b>a&&E[b]<mx*.02)b--;
+  return F.slice(a,b+1).map(v=>{const m=v.reduce((q,w)=>q+w,0)/v.length,u=v.map(w=>w-m),n=Math.hypot(...u)||1;return u.map(w=>w/n)});
+}
+function similarity(x,y){
+  const A=feats(x),B=feats(y);if(A.length<3||B.length<3)return 0;
+  const n=A.length,m=B.length,w=Math.max(Math.abs(n-m),Math.ceil(Math.max(n,m)*.3));
+  let prev=new Float32Array(m+1).fill(1e9);prev[0]=0;
+  for(let i=1;i<=n;i++){const cur=new Float32Array(m+1).fill(1e9);
+    for(let j=Math.max(1,i-w);j<=Math.min(m,i+w);j++){let d=0;const a=A[i-1],b=B[j-1];for(let k=0;k<a.length;k++)d+=a[k]*b[k];cur[j]=1-d+Math.min(prev[j],prev[j-1],cur[j-1])}
+    prev=cur}
+  const sim=1-prev[m]/((n+m)/2),lr=Math.min(n,m)/Math.max(n,m);
+  return Math.round(Math.max(0,Math.min(1,(sim-.15)/.6))*Math.sqrt(lr)*100);
+}
+
+/* ===== Shared state ===== */
+let peer=null,isHost=false,hostConn=null,myId='',myName='',code='';
+const S={G:null,chat:[],err:'',dl:0};
+let L={};
+const newL=key=>({key,rec:false});
+
+/* ===== HOST: authority for game state ===== */
+const HS={players:[],G:null,tm:null,dl:0,idx:0,sc:{}};
+function sendAll(m,filter){HS.players.forEach(p=>{if(filter&&!filter(p))return;if(p.id==='host')onMsg(m);else if(p.conn&&p.conn.open)p.conn.send(m)})}
+function pub(){
+  const G=HS.G;
+  sendAll({k:'state',G:{phase:G.phase,round:G.round,total:G.total,singer:G.singer,results:G.results,done:Object.keys(HS.sc).length,
+    players:HS.players.map(p=>({id:p.id,name:p.name,score:p.score,gone:!!p.gone})),rem:Math.max(0,HS.dl-Date.now())}});
+}
+function setPhase(ph,ms,next){clearTimeout(HS.tm);HS.G.phase=ph;HS.dl=ms?Date.now()+ms:0;if(ms)HS.tm=setTimeout(next,ms);pub()}
+const guessers=()=>HS.players.filter(p=>p.id!==HS.G.singer&&!p.gone);
+function startGame(){
+  if(HS.players.length<2)return;
+  HS.players.forEach(p=>p.score=0);HS.G.total=HS.players.length;HS.idx=0;turn();
+}
+function turn(){
+  const a=HS.players;while(HS.idx<a.length&&a[HS.idx].gone)HS.idx++;
+  if(HS.idx>=a.length)return setPhase('final',0);
+  HS.G.round=HS.idx+1;HS.G.singer=a[HS.idx].id;HS.G.results=null;HS.sc={};
+  setPhase('sing',60000,()=>finishTurn(true));
+}
+function finishTurn(skip){
+  if(HS.G.phase==='result'||HS.G.phase==='final')return;
+  const a=HS.players,sing=a.find(p=>p.id===HS.G.singer),gs=guessers();
+  const rows=gs.map(p=>({id:p.id,name:p.name,sc:HS.sc[p.id]||0,pts:0})).sort((x,y)=>y.sc-x.sc);
+  PLACE_PTS.forEach((pt,i)=>{if(rows[i]&&rows[i].sc>=MIN_PTS)rows[i].pts=pt});
+  const k=rows.filter(r=>r.sc>=ACCURATE).length,ratio=gs.length?k/gs.length:0;
+  const sp=skip?0:ratio>=.6?5:ratio>=.3?3:k>0?1:0;
+  rows.forEach(r=>a.find(p=>p.id===r.id).score+=r.pts);sing.score+=sp;
+  HS.G.results={singer:sing.name,sp,k,rows};
+  setPhase('result',RESULT_MS,()=>{HS.idx++;turn()});
+}
+function checkDone(){if(HS.G.phase==='attempt'&&guessers().every(p=>p.id in HS.sc))finishTurn()}
+function hostRecv(id,m){
+  const p=HS.players.find(q=>q.id===id);if(!p)return;
+  if(m.k==='chat'){sendAll({k:'chat',from:p.name,text:String(m.text).slice(0,300)})}
+  else if(m.k==='orig'&&HS.G.phase==='sing'&&id===HS.G.singer){
+    setPhase('listen',LISTEN_MS,()=>setPhase('attempt',ATT_MS,()=>finishTurn()));
+    sendAll({k:'audio',buf:m.buf,mime:m.mime},q=>q.id!==id&&!q.gone);
+  }
+  else if(m.k==='score'&&HS.G.phase==='attempt'&&id!==HS.G.singer){HS.sc[id]=Math.max(0,Math.min(100,+m.sc||0));pub();checkDone()}
+}
+function hJoin(conn,name){
+  const deny=t=>{conn.send({k:'err',m:t});setTimeout(()=>conn.close(),300)};
+  if(HS.G.phase!=='lobby')return deny('That game already started.');
+  if(HS.players.length>=MAXP)return deny('Room is full (max 6 players).');
+  const id='p'+Math.random().toString(36).slice(2,8);
+  HS.players.push({id,name:String(name||'Player').slice(0,16),conn,score:0});
+  conn.send({k:'hi',id});sendAll({k:'chat',sys:1,text:HS.players.at(-1).name+' joined'});pub();
+}
+function onDrop(conn){
+  const p=HS.players.find(q=>q.conn===conn);if(!p)return;
+  sendAll({k:'chat',sys:1,text:p.name+' left'});
+  if(HS.G.phase==='lobby'){HS.players=HS.players.filter(q=>q!==p)}
+  else{p.gone=true;if(HS.G.singer===p.id&&['sing','listen','attempt'].includes(HS.G.phase))finishTurn(true);else checkDone()}
+  pub();
+}
+
+/* ===== Networking setup ===== */
+function openRoom(c){
+  code=c;isHost=true;myId='host';
+  HS.players=[{id:'host',name:myName,score:0}];HS.G={phase:'lobby',round:0,total:0,singer:'',results:null};
+  peer=new Peer('rvduel-'+code.toLowerCase());
+  peer.on('open',()=>{S.err='';pub()});
+  peer.on('connection',conn=>{
+    conn.on('data',m=>{if(m.k==='join')hJoin(conn,m.name);else{const p=HS.players.find(q=>q.conn===conn);if(p)hostRecv(p.id,m)}});
+    conn.on('close',()=>onDrop(conn));
+  });
+  peer.on('error',e=>{if(e.type==='unavailable-id')openRoom(newCode());else{S.err='Connection problem: '+e.type;render()}});
+}
+function joinRoom(c){
+  code=c;isHost=false;
+  peer=new Peer();
+  peer.on('open',()=>{
+    hostConn=peer.connect('rvduel-'+code.toLowerCase(),{reliable:true});
+    hostConn.on('open',()=>hostConn.send({k:'join',name:myName}));
+    hostConn.on('data',onMsg);
+    hostConn.on('close',()=>{S.err='Disconnected from the room. Refresh to start again.';render()});
+  });
+  peer.on('error',e=>{S.err=e.type==='peer-unavailable'?'Room not found. Check the code, and make sure the host created it first.':'Connection problem: '+e.type;render()});
+}
+const sendHost=m=>isHost?hostRecv('host',m):(hostConn&&hostConn.open&&hostConn.send(m));
+
+/* ===== Client-side message handling (also used by the host for itself) ===== */
+function onMsg(m){
+  if(m.k==='hi')myId=m.id;
+  else if(m.k==='err'){S.err=m.m;S.G=null;render()}
+  else if(m.k==='chat'){S.chat.push(m);renderMsgs()}
+  else if(m.k==='state'){
+    const key=m.G.round+(m.G.phase==='lobby'?'L':'');
+    if(L.key!==key)L=newL(key);
+    S.G=m.G;S.dl=Date.now()+m.G.rem;render();
+  }
+  else if(m.k==='audio'){
+    const blob=new Blob([m.buf],{type:m.mime});
+    Promise.all([decode(blob,false),decode(blob,true)]).then(([f,r])=>{L.origBuf=f;L.revBuf=r;render()}).catch(()=>{S.err='This device could not play the received audio.';render()});
+  }
+}
+
+/* ===== Recording ===== */
+async function startRec(maxMs,done){
+  try{
+    const st=await navigator.mediaDevices.getUserMedia({audio:true});
+    const mr=new MediaRecorder(st,{audioBitsPerSecond:24000}),ch=[];
+    mr.ondataavailable=e=>ch.push(e.data);
+    mr.onstop=async()=>{clearTimeout(L.rt);st.getTracks().forEach(t=>t.stop());L.rec=false;
+      try{await done(new Blob(ch,{type:mr.mimeType}))}catch(e){S.err='Could not process that recording. Try again.'}render()};
+    mr.start();L.mr=mr;L.rec=true;S.err='';L.rt=setTimeout(stopRec,maxMs);render();
+  }catch(e){S.err='Microphone blocked. Allow mic access in your browser and try again.';render()}
+}
+const stopRec=()=>{if(L.mr&&L.mr.state==='recording')L.mr.stop()};
+async function submitAtt(){
+  if(L.sub)return;L.sub=true;render();
+  try{L.sc=similarity(mono8(L.origBuf),mono8(L.attBuf).reverse())}catch(e){L.sc=0}
+  sendHost({k:'score',sc:L.sc});render();
+}
+
+/* ===== UI ===== */
+const recBtn=t=>L.rec?'<button class="rec" data-a="stop">⏹ Stop</button>':`<button class="rec" data-a="rec">🎙 ${t}</button>`;
+const nameOf=id=>(S.G.players.find(p=>p.id===id)||{name:'?'}).name;
+function header(G){
+  return `<div class="card"><span class="pill">Round ${G.round} of ${G.total}</span> <span class="pill" id="cd"></span><br>`+
+    G.players.map(p=>`<span class="chip ${p.id===G.singer?'on':''}">${p.id===G.singer?'🎤 ':''}${esc(p.name)}${p.gone?' (left)':''} <b>${p.score}</b></span>`).join('')+'</div>';
+}
+function mainHTML(){
+  const G=S.G,me=G.singer===myId;let h='';
+  if(G.phase==='lobby'){
+    h=`<div class="card"><p class="mut" style="text-align:center;margin:0">Room code</p><div class="big">${esc(code)}</div>
+      <button class="alt" data-a="copy">📋 Copy invite link</button></div>
+      <div class="card"><p class="step">Players (${G.players.length}/${MAXP})</p>${G.players.map(p=>`<span class="chip">${esc(p.name)}</span>`).join('')}
+      ${isHost?`<button data-a="start" ${G.players.length<2?'disabled':''}>Start game</button><p class="mut">Need at least 2 players.</p>`:'<p class="mut">Waiting for the host to start…</p>'}</div>`;
+  }else if(G.phase==='final'){
+    const s=[...G.players].sort((a,b)=>b.score-a.score),top=s[0].score,w=s.filter(p=>p.score===top);
+    h=`<div class="card" style="text-align:center"><h2 style="margin:4px 0">${w.length>1?'Tie: '+w.map(p=>esc(p.name)).join(' & ')+' 🎉':esc(w[0].name)+' wins! 🏆'}</h2></div>
+      <div class="card"><table>${s.map((p,i)=>`<tr><td>${i+1}</td><td>${esc(p.name)}</td><td><b>${p.score}</b></td></tr>`).join('')}</table>
+      ${isHost?'<button data-a="again">Play again</button>':'<p class="mut">The host can start a new game.</p>'}</div>`;
+  }else{
+    h=header(G);
+    if(G.phase==='sing'){
+      h+=me?`<div class="card"><p class="step">Your turn! Sing or say something (max 8s)</p>`+
+        (!L.orig?recBtn('Record'):`<button class="alt" data-a="play-orig">▶ Play mine</button>${L.sent?'<p class="mut">Sent! Everyone is listening to it backwards.</p>':`<button data-a="send">Send to everyone</button>${recBtn('Re-record')}`}`)+'</div>'
+        :`<div class="card"><p class="step">${esc(nameOf(G.singer))} is singing…</p><p class="mut">Get ready: you will hear it backwards.</p></div>`;
+    }else if(G.phase==='listen'){
+      h+=me?'<div class="card"><p class="step">Everyone is listening to your song, reversed.</p></div>'
+        :`<div class="card"><p class="step">Listen to ${esc(nameOf(G.singer))}’s song backwards</p><p class="mut">Replay as often as you like until time runs out. Then you will copy it.</p>
+        <button data-a="play-rev" ${L.revBuf?'':'disabled'}>${L.revBuf?'▶ Play reversed':'Loading audio…'}</button></div>`;
+    }else if(G.phase==='attempt'){
+      h+=me?`<div class="card"><p class="step">Players are copying your song…</p><p class="mut">${G.done} of ${G.players.filter(p=>p.id!==G.singer&&!p.gone).length} submitted</p></div>`
+        :`<div class="card"><p class="step">Sing it back, exactly as you heard it reversed</p>`+
+          (L.sub?`<p class="step">Submitted! Your match: ${L.sc==null?'…':L.sc+'%'}</p><p class="mut">Waiting for the others…</p>`
+           :(!L.att?recBtn('Record my attempt')
+             :`<button class="alt" data-a="play-att">⏪ Hear my attempt reversed</button><button data-a="submit">Submit attempt</button>${recBtn('Re-record')}`))+'</div>';
+    }else if(G.phase==='result'){
+      const R=G.results;
+      h+=`<div class="card"><p class="step">${esc(R.singer)} sang. ${R.k} accurate cop${R.k===1?'y':'ies'}.</p>
+        <table><tr><th>Player</th><th>Match</th><th>Points</th></tr>${R.rows.map(r=>`<tr><td>${esc(r.name)}</td><td>${r.sc}%</td><td>+${r.pts}</td></tr>`).join('')}
+        <tr><td>${esc(R.singer)} 🎤</td><td></td><td>+${R.sp}</td></tr></table><p class="mut">Next round starting soon…</p></div>`;
+    }
+  }
+  return h;
+}
+function render(){
+  const app=$('app');
+  if(!S.G){
+    const hash=location.hash.slice(1).toUpperCase();
+    app.innerHTML=`<h1>🔁 Reverse Duel</h1><p class="sub">Hear it backwards. Sing it backwards. Win.</p>${S.err?`<div class="card err">${esc(S.err)}</div>`:''}
+      <div class="card"><input id="nm" placeholder="Your name" maxlength="16" value="${esc(myName)}">
+      <button data-a="create">Create a room</button><p class="mut" style="text-align:center;margin:8px 0">or join friends</p>
+      <input id="cd0" placeholder="Room code" maxlength="6" style="text-transform:uppercase;text-align:center" value="${esc(hash)}">
+      <button class="alt" data-a="join">Join room</button></div>
+      <p class="mut" style="text-align:center">2 to 6 players · everyone needs a mic and internet</p>`;
+    return;
+  }
+  if(!$('main'))app.innerHTML=`<h1>🔁 Reverse Duel</h1><div id="err"></div><div id="main"></div>
+    <div class="card"><div id="msgs"></div><div class="row"><input id="ci" placeholder="Chat…" maxlength="300"><button data-a="chat">Send</button></div></div>`;
+  $('err').innerHTML=S.err?`<div class="card err">${esc(S.err)}</div>`:'';
+  $('main').innerHTML=mainHTML();renderMsgs();
+}
+function renderMsgs(){
+  const m=$('msgs');if(!m)return;
+  m.innerHTML=S.chat.map(c=>c.sys?`<p class="sys">${esc(c.text)}</p>`:`<p><b>${esc(c.from)}:</b> ${esc(c.text)}</p>`).join('');m.scrollTop=m.scrollHeight;
+}
+function sendChat(){const i=$('ci');if(!i||!i.value.trim())return;sendHost({k:'chat',text:i.value.trim()});i.value=''}
+
+document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.id==='ci')sendChat()});
+document.addEventListener('click',async e=>{
+  const a=e.target.closest('button')?.dataset.a;if(!a)return;
+  const nm=$('nm');if(nm)myName=(nm.value.trim()||'Player').slice(0,16);
+  if(a==='create'){S.err='';openRoom(newCode())}
+  else if(a==='join'){const c=($('cd0').value||'').trim().replace(/[^a-zA-Z0-9]/g,'').toUpperCase();if(c.length<3){S.err='Enter the room code.';render()}else{S.err='';joinRoom(c)}}
+  else if(a==='chat')sendChat();
+  else if(a==='copy'){const u=location.href.split('#')[0]+'#'+code;try{await navigator.clipboard.writeText(u);e.target.textContent='✓ Copied'}catch(x){prompt('Copy this link:',u)}}
+  else if(a==='start')startGame();
+  else if(a==='again'){clearTimeout(HS.tm);HS.G.phase='lobby';HS.G.round=0;HS.sc={};HS.dl=0;pub()}
+  else if(a==='rec')startRec(L.key&&S.G.phase==='sing'?SING_MAX:ATT_REC,async b=>{
+    if(S.G.phase==='sing')L.orig=b;else{L.att=b;L.attBuf=await decode(b,false);L.attRev=await decode(b,true)}});
+  else if(a==='stop')stopRec();
+  else if(a==='play-orig')new Audio(URL.createObjectURL(L.orig)).play();
+  else if(a==='send'){L.sent=true;render();sendHost({k:'orig',buf:await L.orig.arrayBuffer(),mime:L.orig.type})}
+  else if(a==='play-rev'&&L.revBuf)playBuf(L.revBuf);
+  else if(a==='play-att'&&L.attRev)playBuf(L.attRev);
+  else if(a==='submit')submitAtt();
+});
+setInterval(()=>{
+  const e=$('cd');if(e&&S.dl){const s=Math.max(0,Math.ceil((S.dl-Date.now())/1000));e.textContent='⏱ '+s+'s'}
+  if(S.G&&S.G.phase==='attempt'&&L.att&&!L.sub&&S.dl-Date.now()<1500)submitAtt();
+},250);
+render();
+</script></body></html>
